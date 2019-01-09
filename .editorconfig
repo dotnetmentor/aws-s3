@@ -1,0 +1,13 @@
+; EditorConfig - http://editorconfig.org/
+
+; Top-most EditorConfig file
+root = true
+
+; Newlines
+[*]
+end_of_line = LF
+
+
+[*.go]
+indent_style = tab
+indent_size = 2
