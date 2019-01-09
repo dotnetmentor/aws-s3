@@ -2,6 +2,11 @@
 
 A tool for doing common AWS S3 tasks
 
+[![Docker Automated build](https://img.shields.io/docker/automated/dotnetmentor/aws-s3.svg?style=for-the-badge)](https://hub.docker.com/r/dotnetmentor/aws-s3/)
+[![Docker Build Status](https://img.shields.io/docker/build/dotnetmentor/aws-s3.svg?style=for-the-badge)](https://hub.docker.com/r/dotnetmentor/aws-s3/)
+[![MicroBadger Size](https://img.shields.io/microbadger/image-size/dotnetmentor/aws-s3.svg?style=for-the-badge)](https://hub.docker.com/r/dotnetmentor/aws-s3/)
+[![Docker Pulls](https://img.shields.io/docker/pulls/dotnetmentor/aws-s3.svg?style=for-the-badge)](https://hub.docker.com/r/dotnetmentor/aws-s3/)
+
 ## Commands
 
 ### Prune command

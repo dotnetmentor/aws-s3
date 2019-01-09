@@ -12,7 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mitchellh/cli"
-	"gopkg.in/cheggaaa/pb.v1"
+	"gopkg.in/cheggaaa/pb.v2"
 )
 
 func pruneCommandFactory() (cli.Command, error) {
@@ -187,7 +187,9 @@ func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxF
 			if (len(allObjs) + len(p.Contents)) > maxFiles {
 				size = maxFiles - len(allObjs)
 			}
-			bar = pb.StartNew(size).Prefix(fmt.Sprintf("  page %d:", i))
+			bar = pb.ProgressBarTemplate(fmt.Sprintf(`{{ blue "  page %d: " }} {{bar . "[" "=" ">" "_" "]" | green}} {{counters . | blue}}`, i)).Start(size)
+			defer bar.Finish()
+			bar.Set("prefix", fmt.Sprintf("  page %d: ", i))
 		}
 
 		for _, obj := range p.Contents {
@@ -213,10 +215,6 @@ func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxF
 			if len(allObjs) >= maxFiles {
 				return false
 			}
-		}
-
-		if showProgress {
-			bar.Finish()
 		}
 
 		return true
