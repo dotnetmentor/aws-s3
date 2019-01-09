@@ -21,7 +21,9 @@ func pruneCommandFactory() (cli.Command, error) {
 	c.Region = c.Flags.String("region", "eu-central-1", "Region")
 	c.Prefix = c.Flags.String("prefix", "", "Key prefix")
 	c.MaxAge = c.Flags.Duration("max-age", 24*time.Hour, "Max age")
+	c.MaxFiles = c.Flags.Int("max-files", 10000, "Max files to process")
 	c.DryRun = c.Flags.Bool("dry-run", false, "Dry run")
+	c.ShowProgress = c.Flags.Bool("progress", false, "Show progress")
 	c.ListFiles = c.Flags.Bool("list-files", false, "List files")
 	c.ListFolders = c.Flags.Bool("list-folders", true, "List folders")
 	return c, nil
@@ -29,14 +31,16 @@ func pruneCommandFactory() (cli.Command, error) {
 
 // PruneCommand removes old s3 objects
 type pruneCommand struct {
-	Flags       *flag.FlagSet
-	Bucket      *string
-	Region      *string
-	Prefix      *string
-	MaxAge      *time.Duration
-	DryRun      *bool
-	ListFiles   *bool
-	ListFolders *bool
+	Flags        *flag.FlagSet
+	Bucket       *string
+	Region       *string
+	Prefix       *string
+	MaxAge       *time.Duration
+	MaxFiles     *int
+	DryRun       *bool
+	ShowProgress *bool
+	ListFiles    *bool
+	ListFolders  *bool
 }
 
 func (c *pruneCommand) Run(args []string) int {
@@ -46,15 +50,14 @@ func (c *pruneCommand) Run(args []string) int {
 	region := *c.Region
 	prefix := *c.Prefix
 	maxAge := *c.MaxAge
+	maxFiles := *c.MaxFiles
 	dryrun := *c.DryRun
+	showProgress := *c.ShowProgress
 
 	if bucket == "" || region == "" || prefix == "" {
 		c.Flags.PrintDefaults()
 		os.Exit(1)
 	}
-
-	start := time.Now()
-	fmt.Printf("searching for matching s3 objects (bucket=%s region=%s prefix=%s max-age=%s dry-run=%v)\n", bucket, region, prefix, maxAge, dryrun)
 
 	sess := session.Must(session.NewSession(&aws.Config{
 		Region: aws.String(region),
@@ -62,10 +65,16 @@ func (c *pruneCommand) Run(args []string) int {
 
 	svc := s3.New(sess)
 
-	removeObjs, keepObjs, err := searchObjects(svc, bucket, region, prefix, start, maxAge)
+	start := time.Now()
+	fmt.Printf("searching for matching s3 objects (bucket=%s region=%s prefix=%s max-age=%s max-files=%v dry-run=%v)\n", bucket, region, prefix, maxAge, maxFiles, dryrun)
+
+	objs, err := searchObjects(svc, bucket, region, prefix, maxFiles, showProgress)
 	if err == nil {
+		sortObjects(objs)
+		removeObjs, keepObjs := processObjects(objs, start, maxAge)
 		removeObjects(svc, bucket, removeObjs, dryrun, *c.ListFiles, *c.ListFolders)
 		keepObjects(keepObjs, dryrun, *c.ListFiles, *c.ListFolders)
+		fmt.Printf("completed in %v seconds", time.Since(start).Seconds())
 	} else {
 		fmt.Println(err)
 	}
@@ -85,8 +94,6 @@ func (c *pruneCommand) Synopsis() string {
 
 func removeObjects(svc *s3.S3, bucket string, objs []Object, dryrun bool, listFiles bool, listDirectories bool) {
 	batchSize := 1000
-
-	sortObjects(objs)
 	folders := countFolders(objs)
 
 	if dryrun {
@@ -151,22 +158,19 @@ func removeObjectsBatch(svc *s3.S3, bucket string, ids []*s3.ObjectIdentifier) {
 }
 
 func keepObjects(objs []Object, dryrun bool, listFiles bool, listDirectories bool) {
-	sortObjects(objs)
 	folders := countFolders(objs)
 
 	if dryrun {
 		fmt.Printf("would keep %v s3 objects in %v folders\n", len(objs), folders)
 	} else {
-		fmt.Printf("keeping %v s3 objects in %v folders in\n", len(objs), folders)
+		fmt.Printf("keeping %v s3 objects in %v folders\n", len(objs), folders)
 	}
 
 	printObjects(objs, listFiles, listDirectories)
 }
 
-func searchObjects(svc *s3.S3, bucket string, region string, prefix string, start time.Time, maxAge time.Duration) ([]Object, []Object, error) {
+func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxFiles int, showProgress bool) ([]Object, error) {
 	allObjs := make([]Object, 0)
-	removeObjs := make([]Object, 0)
-	keepObjs := make([]Object, 0)
 
 	i := 0
 	err := svc.ListObjectsPages(&s3.ListObjectsInput{
@@ -175,37 +179,53 @@ func searchObjects(svc *s3.S3, bucket string, region string, prefix string, star
 	}, func(p *s3.ListObjectsOutput, last bool) (shouldContinue bool) {
 		i++
 		for _, obj := range p.Contents {
-			allObjs = append(allObjs, Object{
-				Bucket: bucket,
-				Key:    *obj.Key,
+			if len(allObjs)%100 == 0 && showProgress {
+				fmt.Print(".")
+			}
+
+			objData, err := svc.HeadObject(&s3.HeadObjectInput{
+				Bucket: &bucket,
+				Key:    obj.Key,
 			})
+
+			if err != nil {
+				return false
+			}
+
+			allObjs = append(allObjs, Object{
+				Bucket:       bucket,
+				Key:          *obj.Key,
+				LastModified: *objData.LastModified,
+			})
+
+			if len(allObjs) >= maxFiles {
+				return false
+			}
 		}
 		return true
 	})
 
-	if err != nil {
-		return nil, nil, err
+	if showProgress {
+		fmt.Print("\n")
 	}
 
-	for _, obj := range allObjs {
-		objData, err := svc.HeadObject(&s3.HeadObjectInput{
-			Bucket: &bucket,
-			Key:    &obj.Key,
-		})
+	if err != nil {
+		return nil, err
+	}
 
-		if err != nil {
-			return nil, nil, err
-		}
+	return allObjs, nil
+}
 
-		if objData.LastModified != nil {
-			obj.LastModified = *objData.LastModified
-		}
+func processObjects(objs []Object, start time.Time, maxAge time.Duration) ([]Object, []Object) {
+	removeObjs := make([]Object, 0)
+	keepObjs := make([]Object, 0)
 
+	for _, obj := range objs {
 		parts := strings.Split(obj.Key, "/")
 		obj.File = parts[len(parts)-1]
 		obj.Folder = strings.Join(parts[:len(parts)-1], "/")
-
 		obj.Age = start.Sub(obj.LastModified)
+
 		if obj.Age > maxAge {
 			removeObjs = append(removeObjs, obj)
 		} else {
@@ -213,5 +233,5 @@ func searchObjects(svc *s3.S3, bucket string, region string, prefix string, star
 		}
 	}
 
-	return removeObjs, keepObjs, nil
+	return removeObjs, keepObjs
 }
