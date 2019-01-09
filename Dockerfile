@@ -3,7 +3,9 @@ RUN apk update && apk add --no-cache git ca-certificates && update-ca-certificat
 COPY . $GOPATH/src/aws-s3/
 WORKDIR $GOPATH/src/aws-s3/
 RUN go get -d -v
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -ldflags="-w -s" -o /go/bin/aws-s3
+ARG CACHE_TAG
+ARG SOURCE_COMMIT
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -ldflags "-X 'main.version=$CACHE_TAG' -X 'main.commit=$SOURCE_COMMIT'" -o /go/bin/aws-s3
 
 FROM scratch
 COPY --from=builder /go/bin/aws-s3 /go/bin/aws-s3

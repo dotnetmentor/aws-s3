@@ -7,6 +7,11 @@ import (
 	"github.com/mitchellh/cli"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+)
+
 func main() {
 	os.Exit(run(os.Args[1:]))
 }
@@ -15,7 +20,7 @@ func run(args []string) int {
 	// Initialize cli
 	c := &cli.CLI{
 		Name:    "aws-s3",
-		Version: "1.0.0",
+		Version: fmt.Sprintf("%s-%s", version, commit),
 		Commands: map[string]cli.CommandFactory{
 			"prune": pruneCommandFactory,
 		},

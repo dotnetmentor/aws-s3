@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+
+declare SHA
+declare TAG
+
+SHA="$(git rev-parse --short HEAD)"
+TAG='latest'
+
+docker build -t "dotnetmentor/aws-s3:${TAG}" . --build-arg SOURCE_COMMIT="${SHA:?}" --build-arg CACHE_TAG="${TAG:?}"
+
+if [[ -f ./.env ]]; then
+  # shellcheck disable=SC1091
+  source ./.env
+fi
+
+docker run -e AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID:?}" -e AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY:?}" "dotnetmentor/aws-s3:${TAG}" "$@"
