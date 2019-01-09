@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/mitchellh/cli"
+	"gopkg.in/cheggaaa/pb.v1"
 )
 
 func pruneCommandFactory() (cli.Command, error) {
@@ -66,7 +67,7 @@ func (c *pruneCommand) Run(args []string) int {
 	svc := s3.New(sess)
 
 	start := time.Now()
-	fmt.Printf("searching for matching s3 objects (bucket=%s region=%s prefix=%s max-age=%s max-files=%v dry-run=%v)\n", bucket, region, prefix, maxAge, maxFiles, dryrun)
+	fmt.Printf("searching s3 (bucket=%s region=%s prefix=%s max-age=%s max-files=%v dry-run=%v)\n", bucket, region, prefix, maxAge, maxFiles, dryrun)
 
 	objs, err := searchObjects(svc, bucket, region, prefix, maxFiles, showProgress)
 	if err == nil {
@@ -170,6 +171,8 @@ func keepObjects(objs []Object, dryrun bool, listFiles bool, listDirectories boo
 }
 
 func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxFiles int, showProgress bool) ([]Object, error) {
+	var bar *pb.ProgressBar
+
 	allObjs := make([]Object, 0)
 
 	i := 0
@@ -178,11 +181,16 @@ func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxF
 		Prefix: aws.String(prefix),
 	}, func(p *s3.ListObjectsOutput, last bool) (shouldContinue bool) {
 		i++
-		for _, obj := range p.Contents {
-			if len(allObjs)%100 == 0 && showProgress {
-				fmt.Print(".")
-			}
 
+		if showProgress {
+			size := len(p.Contents)
+			if (len(allObjs) + len(p.Contents)) > maxFiles {
+				size = maxFiles - len(allObjs)
+			}
+			bar = pb.StartNew(size).Prefix(fmt.Sprintf("  page %d:", i))
+		}
+
+		for _, obj := range p.Contents {
 			objData, err := svc.HeadObject(&s3.HeadObjectInput{
 				Bucket: &bucket,
 				Key:    obj.Key,
@@ -198,16 +206,21 @@ func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxF
 				LastModified: *objData.LastModified,
 			})
 
+			if showProgress {
+				bar.Increment()
+			}
+
 			if len(allObjs) >= maxFiles {
 				return false
 			}
 		}
+
+		if showProgress {
+			bar.Finish()
+		}
+
 		return true
 	})
-
-	if showProgress {
-		fmt.Print("\n")
-	}
 
 	if err != nil {
 		return nil, err
