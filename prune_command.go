@@ -1,16 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 	"github.com/mitchellh/cli"
 	"gopkg.in/cheggaaa/pb.v2"
 )
@@ -60,22 +62,30 @@ func (c *pruneCommand) Run(args []string) int {
 		os.Exit(1)
 	}
 
-	sess := session.Must(session.NewSession(&aws.Config{
-		Region: aws.String(region),
-	}))
+	sess, err := config.LoadDefaultConfig(context.TODO(), func(lo *config.LoadOptions) error {
+		lo.Region = region
+		return nil
+	})
+	if err != nil {
+		fmt.Println(err)
+		return 1
+	}
 
-	svc := s3.New(sess)
+	svc := s3.NewFromConfig(sess)
 
 	start := time.Now()
 	fmt.Printf("searching s3 (bucket=%s region=%s prefix=%s max-age=%s max-files=%v dry-run=%v)\n", bucket, region, prefix, maxAge, maxFiles, dryrun)
 
-	objs, err := searchObjects(svc, bucket, region, prefix, maxFiles, showProgress)
+	objs, truncated, err := searchObjects(svc, bucket, region, prefix, maxFiles, showProgress)
 	if err == nil {
+		if truncated {
+			fmt.Printf("WARN: results was truncated due to max-files limit of %d\n", maxFiles)
+		}
 		sortObjects(objs)
 		removeObjs, keepObjs := processObjects(objs, start, maxAge)
 		removeObjects(svc, bucket, removeObjs, dryrun, *c.ListFiles, *c.ListFolders)
 		keepObjects(keepObjs, dryrun, *c.ListFiles, *c.ListFolders)
-		fmt.Printf("completed in %v seconds", time.Since(start).Seconds())
+		fmt.Printf("completed in %v seconds\n", time.Since(start).Seconds())
 	} else {
 		fmt.Println(err)
 	}
@@ -93,7 +103,7 @@ func (c *pruneCommand) Synopsis() string {
 	return "Runs cleanup of s3 objects"
 }
 
-func removeObjects(svc *s3.S3, bucket string, objs []Object, dryrun bool, listFiles bool, listDirectories bool) {
+func removeObjects(svc *s3.Client, bucket string, objs []Object, dryrun bool, listFiles bool, listDirectories bool) {
 	batchSize := 1000
 	folders := countFolders(objs)
 
@@ -110,14 +120,14 @@ func removeObjects(svc *s3.S3, bucket string, objs []Object, dryrun bool, listFi
 		return
 	}
 
-	ids := make([]*s3.ObjectIdentifier, 0)
+	ids := make([]types.ObjectIdentifier, 0)
 	for _, obj := range objs {
-		ids = append(ids, &s3.ObjectIdentifier{
+		ids = append(ids, types.ObjectIdentifier{
 			Key: aws.String(obj.Key),
 		})
 	}
 
-	batches := make([][]*s3.ObjectIdentifier, 0)
+	batches := make([][]types.ObjectIdentifier, 0)
 	for i := 0; i < len(ids); i += batchSize {
 		end := i + batchSize
 
@@ -133,19 +143,19 @@ func removeObjects(svc *s3.S3, bucket string, objs []Object, dryrun bool, listFi
 	}
 }
 
-func removeObjectsBatch(svc *s3.S3, bucket string, ids []*s3.ObjectIdentifier) {
+func removeObjectsBatch(svc *s3.Client, bucket string, ids []types.ObjectIdentifier) {
 	input := &s3.DeleteObjectsInput{
 		Bucket: aws.String(bucket),
-		Delete: &s3.Delete{
+		Delete: &types.Delete{
 			Objects: ids,
-			Quiet:   aws.Bool(false),
+			Quiet:   false,
 		},
 	}
 
-	result, err := svc.DeleteObjects(input)
+	result, err := svc.DeleteObjects(context.TODO(), input)
 	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
+		if aerr, ok := err.(*smithy.GenericAPIError); ok {
+			switch aerr.Code {
 			default:
 				fmt.Println(aerr.Error())
 			}
@@ -170,42 +180,46 @@ func keepObjects(objs []Object, dryrun bool, listFiles bool, listDirectories boo
 	printObjects(objs, listFiles, listDirectories)
 }
 
-func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxFiles int, showProgress bool) ([]Object, error) {
-	var bar *pb.ProgressBar
-
+func searchObjects(svc *s3.Client, bucket string, region string, prefix string, maxFiles int, showProgress bool) ([]Object, bool, error) {
 	allObjs := make([]Object, 0)
-
 	i := 0
-	err := svc.ListObjectsPages(&s3.ListObjectsInput{
+	pageSize := 1000
+	truncated := false
+
+	if pageSize > maxFiles {
+		pageSize = maxFiles
+	}
+
+	p := s3.NewListObjectsV2Paginator(svc, &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucket),
 		Prefix: aws.String(prefix),
-	}, func(p *s3.ListObjectsOutput, last bool) (shouldContinue bool) {
+	}, func(o *s3.ListObjectsV2PaginatorOptions) {
+		o.Limit = int32(pageSize)
+	})
+
+	for p.HasMorePages() {
 		i++
 
-		if showProgress {
-			size := len(p.Contents)
-			if (len(allObjs) + len(p.Contents)) > maxFiles {
-				size = maxFiles - len(allObjs)
-			}
-			bar = pb.ProgressBarTemplate(fmt.Sprintf(`{{ blue "  page %d: " }} {{bar . "[" "=" ">" "_" "]" | green}} {{counters . | blue}}`, i)).Start(size)
-			defer bar.Finish()
-			bar.Set("prefix", fmt.Sprintf("  page %d: ", i))
+		page, err := p.NextPage(context.TODO())
+		if err != nil {
+			fmt.Printf("failed to get page %v, %v", i, err)
 		}
 
-		for _, obj := range p.Contents {
-			objData, err := svc.HeadObject(&s3.HeadObjectInput{
-				Bucket: &bucket,
-				Key:    obj.Key,
-			})
-
-			if err != nil {
-				return false
+		var bar *pb.ProgressBar
+		if showProgress {
+			barSize := len(page.Contents)
+			maxItemsLeft := maxFiles - len(allObjs)
+			if barSize > maxItemsLeft {
+				barSize = maxItemsLeft
 			}
+			bar = pb.ProgressBarTemplate(fmt.Sprintf(`{{ blue "  page %d: " }} {{bar . "[" "=" ">" "_" "]" | green}} {{counters . | blue}}`, i)).Start(barSize)
+		}
 
+		for _, obj := range page.Contents {
 			allObjs = append(allObjs, Object{
 				Bucket:       bucket,
 				Key:          *obj.Key,
-				LastModified: *objData.LastModified,
+				LastModified: *obj.LastModified,
 			})
 
 			if showProgress {
@@ -213,18 +227,22 @@ func searchObjects(svc *s3.S3, bucket string, region string, prefix string, maxF
 			}
 
 			if len(allObjs) >= maxFiles {
-				return false
+				truncated = true
+				break
 			}
 		}
 
-		return true
-	})
+		if showProgress {
+			bar.Finish()
+		}
 
-	if err != nil {
-		return nil, err
+		if len(allObjs) >= maxFiles {
+			truncated = true
+			break
+		}
 	}
 
-	return allObjs, nil
+	return allObjs, truncated, nil
 }
 
 func processObjects(objs []Object, start time.Time, maxAge time.Duration) ([]Object, []Object) {
